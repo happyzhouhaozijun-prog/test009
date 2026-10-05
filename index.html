@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <title>键盘 + 串口控制 3D Demo</title>
+  <style>
+    body { margin: 0; overflow: hidden; background: #111; }
+    #info {
+      position: absolute; top: 10px; left: 10px;
+      color: #fff; font-family: sans-serif; font-size: 14px;
+      background: rgba(0,0,0,0.5); padding: 8px 12px; border-radius: 6px;
+      pointer-events: none; line-height: 1.6;
+    }
+    #connectBtn {
+      position: absolute; top: 10px; right: 10px;
+      padding: 10px 18px; font-size: 14px; font-family: sans-serif;
+      background: #2a7fff; color: #fff; border: none; border-radius: 6px;
+      cursor: pointer; z-index: 10;
+    }
+    #connectBtn:hover { background: #1a6ae0; }
+    #connectBtn.connected { background: #28a745; }
+    #log {
+      position: absolute; bottom: 10px; left: 10px;
+      color: #9f9; font-family: monospace; font-size: 12px;
+      background: rgba(0,0,0,0.6); padding: 8px 12px; border-radius: 6px;
+      max-width: 360px; max-height: 160px; overflow-y: auto;
+      pointer-events: none; white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <div id="info">
+    <b>键盘 + 串口控制 3D Demo</b><br>
+    键盘：<code>W/S</code> 前进/后退一格，<code>A/D</code> 左转/右转 90°<br>
+    串口：<code>AT:W\n</code> <code>AT:S\n</code> <code>AT:A\n</code> <code>AT:D\n</code><br>
+    鼠标拖拽旋转视角 / 滚轮缩放
+  </div>
+  <button id="connectBtn">连接串口</button>
+  <div id="log"></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+    // ============================================================
+    // 1. 场景、相机、渲染器
+    // ============================================================
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x111122);
+
+    const camera = new THREE.PerspectiveCamera(
+      60, window.innerWidth / window.innerHeight, 0.1, 1000
+    );
+    camera.position.set(8, 8, 12);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.shadowMap.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // ============================================================
+    // 2. 灯光
+    // ============================================================
+    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+    dirLight.position.set(10, 20, 10);
+    dirLight.castShadow = true;
+    dirLight.shadow.mapSize.set(1024, 1024);
+    scene.add(dirLight);
+
+    // ============================================================
+    // 3. 地面
+    // ============================================================
+    const ground = new THREE.Mesh(
+      new THREE.PlaneGeometry(40, 40),
+      new THREE.MeshStandardMaterial({ color: 0x334455 })
+    );
+    ground.rotation.x = -Math.PI / 2;
+    ground.receiveShadow = true;
+    scene.add(ground);
+
+    const grid = new THREE.GridHelper(40, 40, 0x888888, 0x444444);
+    grid.position.y = 0.01;
+    scene.add(grid);
+
+    // ============================================================
+    // 4. 玩家方块（带一个鼻子，方便看朝向）
+    // ============================================================
+    const player = new THREE.Mesh(
+      new THREE.BoxGeometry(1.5, 1.5, 1.5),
+      new THREE.MeshStandardMaterial({ color: 0x44aaff })
+    );
+    player.position.set(0, 0.75, 0);
+    player.castShadow = true;
+    scene.add(player);
+
+    const nose = new THREE.Mesh(
+      new THREE.ConeGeometry(0.3, 0.8, 4),
+      new THREE.MeshStandardMaterial({ color: 0xffcc00 })
+    );
+    nose.rotation.x = Math.PI / 2;
+    nose.position.set(0, 0, 1.1);
+    player.add(nose);
+
+    // ============================================================
+    // 5. 视角控制
+    // ============================================================
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.copy(player.position);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.1;
+    controls.maxPolarAngle = Math.PI / 2.2;
+
+    // ============================================================
+    // 6. 移动 / 转向逻辑（键盘和串口共用）
+    // ============================================================
+    const CELL = 1.5;                 // 每格距离
+    const MOVE_DURATION = 0.25;       // 平滑移动耗时（秒）
+    const TURN_ANGLE = Math.PI / 2;   // 每次转向 90°
+
+    let targetPosition = player.position.clone();
+    let moveElapsed = 0;
+    let moveStart = player.position.clone();
+    let isMoving = false;
+    let isTurning = false;            // 用于让转向也平滑一点
+
+    // 前进 / 后退一格
+    function stepForward(sign) {
+      // 移动中不允许再触发，避免方向错乱
+      if (isMoving || isTurning) return;
+
+      const forward = new THREE.Vector3(0, 0, 1)
+        .applyQuaternion(player.quaternion)
+        .setY(0)
+        .normalize();
+
+      targetPosition = player.position.clone().addScaledVector(forward, CELL * sign);
+      moveStart = player.position.clone();
+      moveElapsed = 0;
+      isMoving = true;
+    }
+
+    // 左右转 90°
+    function turn(sign) {
+      if (isMoving || isTurning) return;
+
+      const startAngle = player.rotation.y;
+      const endAngle = startAngle + TURN_ANGLE * sign;
+
+      const startTime = performance.now();
+      const duration = 200; // ms，转向动画时长
+      isTurning = true;
+
+      function animateTurn(now) {
+        const t = Math.min((now - startTime) / duration, 1);
+        const eased = 1 - (1 - t) * (1 - t);
+        player.rotation.y = startAngle + (endAngle - startAngle) * eased;
+
+        if (t < 1) {
+          requestAnimationFrame(animateTurn);
+        } else {
+          player.rotation.y = endAngle;
+          isTurning = false;
+        }
+      }
+      requestAnimationFrame(animateTurn);
+    }
+
+    // ============================================================
+    // 7. 键盘输入
+    // ============================================================
+    window.addEventListener('keydown', (e) => {
+      if (e.repeat) return; // 按住不放不重复触发
+
+      switch (e.code) {
+        case 'KeyW':
+          stepForward(1);
+          e.preventDefault();
+          break;
+        case 'KeyS':
+          stepForward(-1);
+          e.preventDefault();
+          break;
+        case 'KeyA':
+          turn(-1);
+          e.preventDefault();
+          break;
+        case 'KeyD':
+          turn(1);
+          e.preventDefault();
+          break;
+      }
+    });
+
+    // ============================================================
+    // 8. 串口相关
+    // ============================================================
+    const connectBtn = document.getElementById('connectBtn');
+    const logEl = document.getElementById('log');
+
+    function log(msg) {
+      logEl.textContent += msg + '\n';
+      logEl.scrollTop = logEl.scrollHeight;
+      if (logEl.textContent.length > 2000) {
+        logEl.textContent = logEl.textContent.slice(-1500);
+      }
+    }
+
+    // 行分帧：把可能分块到达的字节流按 \n 切成完整行
+    class LineBreakTransformer {
+      constructor() { this.container = ''; }
+      transform(chunk, controller) {
+        this.container += chunk;
+        const lines = this.container.split('\n');
+        this.container = lines.pop();
+        lines.forEach(line => controller.enqueue(line));
+      }
+      flush(controller) {
+        if (this.container) controller.enqueue(this.container);
+      }
+    }
+
+    let port = null;
+    let reader = null;
+
+    async function connectSerial() {
+      if (!('serial' in navigator)) {
+        alert('当前浏览器不支持 Web Serial API，请使用 Chrome 或 Edge。');
+        return;
+      }
+
+      try {
+        port = await navigator.serial.requestPort();
+        await port.open({ baudRate: 115200 });
+
+        connectBtn.textContent = '已连接';
+        connectBtn.classList.add('connected');
+        log('串口已连接，波特率 115200');
+
+        readLoop();
+      } catch (err) {
+        log('连接失败：' + err.message);
+        console.error(err);
+      }
+    }
+
+    async function readLoop() {
+      const decoder = new TextDecoderStream();
+      port.readable.pipeTo(decoder.writable);
+      const lineStream = decoder.readable.pipeThrough(
+        new TransformStream(new LineBreakTransformer())
+      );
+      reader = lineStream.getReader();
+
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          handleLine(value);
+        }
+      } catch (err) {
+        log('读取中断：' + err.message);
+      } finally {
+        reader.releaseLock();
+      }
+    }
+
+    function handleLine(line) {
+      const text = line.trim();
+      if (!text) return;
+
+      log('收到: ' + text);
+
+      if (!text.startsWith('AT:')) return;
+      const cmd = text.slice(3).trim();
+
+      switch (cmd) {
+        case 'W': stepForward(1); break;
+        case 'S': stepForward(-1); break;
+        case 'A': turn(-1); break;
+        case 'D': turn(1); break;
+        default: log('未知指令: ' + cmd);
+      }
+    }
+
+    connectBtn.addEventListener('click', () => {
+      if (!port) connectSerial();
+    });
+
+    // ============================================================
+    // 9. 动画循环
+    // ============================================================
+    const clock = new THREE.Clock();
+
+    function animate() {
+      requestAnimationFrame(animate);
+
+      const delta = clock.getDelta();
+
+      if (isMoving) {
+        moveElapsed += delta;
+        const t = Math.min(moveElapsed / MOVE_DURATION, 1);
+        const eased = 1 - (1 - t) * (1 - t);
+        player.position.lerpVectors(moveStart, targetPosition, eased);
+
+        if (t >= 1) {
+          isMoving = false;
+          player.position.copy(targetPosition);
+        }
+      }
+
+      controls.target.lerp(player.position, 0.15);
+      controls.update();
+
+      renderer.render(scene, camera);
+    }
+    animate();
+
+    // ============================================================
+    // 10. 窗口自适应
+    // ============================================================
+    window.addEventListener('resize', () => {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
